@@ -127,30 +127,69 @@ Note: You may need to repeat this when you upgrade PHP.
 
 #### Production Installation via Docker ####
 
-We maintain an official <a href="https://hub.docker.com/r/leantime/leantime">Docker image on dockerhub</a>. 
-To run the image enter your MySQL credentials and execute. You can pass in all the configuration variables from .env
+We maintain an official <a href="https://hub.docker.com/r/leantime/leantime">Docker image on dockerhub</a> and this repository now ships the supported production `docker-compose.yml` for running it.
+
+Set these environment variables in your shell, deployment platform, or container host before starting the stack:
+
+- `LEAN_VERSION` (optional, defaults to `latest`)
+- `LEAN_PORT` (optional, defaults to `8080`)
+- `MYSQL_ROOT_PASSWORD`
+- `MYSQL_DATABASE` (optional, defaults to `leantime`)
+- `MYSQL_USER` (optional, defaults to `leantime`)
+- `MYSQL_PASSWORD`
+- `LEAN_DB_HOST` (optional, defaults to `leantime-db`)
+- `LEAN_DB_PORT` (optional, defaults to `3306`)
+- `LEAN_DB_DATABASE` (optional, defaults to `leantime`)
+- `LEAN_DB_USER` (optional, defaults to `leantime`)
+- `LEAN_DB_PASSWORD`
+- `LEAN_EMAIL_RETURN`
+- `LEAN_SESSION_PASSWORD`
+- `LEAN_LOG_CHANNELS` (optional, defaults to `stderr`)
+- `LEAN_APP_URL` (optional, recommended behind a reverse proxy)
+- `LEAN_APP_DIR` (optional, for subfolder installs)
+
+For local shells, `.docker/.env.example` contains a copyable template, but the compose file no longer depends on an env file being mounted.
+
+Start the stack:
 
 ```
-docker run -d --restart unless-stopped -p 8080:8080 --network leantime-net \
--e LEAN_DB_HOST=mysql_leantime \
--e LEAN_DB_USER=admin \
--e LEAN_DB_PASSWORD=321.qwerty \
--e LEAN_DB_DATABASE=leantime \
--e LEAN_EMAIL_RETURN=changeme@local.local \
---name leantime leantime/leantime:latest
+docker compose up -d
 ```
 
-Unless you have a database defined somewhere else you should use our [docker-compose file](https://github.com/Leantime/docker-leantime/blob/master/docker-compose.yml). 
+Or use the Makefile shortcut:
 
-Once started you can go to `<yourdomain.com>/install` and run the installation script.
+```
+make run-prod
+```
 
-**Important: If you are planning to use plugins you need to mount the plugin folder `plugins:/var/www/html/app/Plugins` and ensure the www-data user has access to it. Otherwise installation may fail or plugins will be removed after a restart**
+The default production stack includes:
+
+- Leantime
+- MySQL
+- Persistent Docker volumes for database data, uploaded files, plugins, and logs
+
+Once the stack is running, open `<yourdomain.com>/install` and complete the installer.
+
+To update an existing deployment:
+
+```
+docker compose pull
+docker compose up -d
+```
+
+Or use:
+
+```
+make update-prod
+```
+
+**Important: If you are planning to use plugins you need the plugin volume `plugins:/var/www/html/app/Plugins`. This repository's production compose file mounts it by default so plugins persist across restarts.**
 
 ##### Docker Installation Notes #####
 
-If you intend to place Leantime behind a reverse proxy (nginx, etc.) to handle custom domain name resolution and SSL offloading, you will need to set the following environment variable in docker
+If you intend to place Leantime behind a reverse proxy (nginx, etc.) to handle custom domain name resolution and SSL offloading, set the following environment variable:
 ```
--e LEAN_APP_URL=https://yourdomain.com \
+LEAN_APP_URL=https://yourdomain.com
 ```
 * Update yourdomain.com to your custom domain name.
 <br /><br />
@@ -255,10 +294,10 @@ Head to [leantime.io](https://leantime.io/) for more information.
 
 We can help you set up Leantime in your environment and customize it to your needs. Our support plans are [outlined on our website](https://leantime.io/priority-support/).
 
-Please note: We currently only support the official Leantime docker compose and standard installations. 
-We only offer support for the most recent version. 
+Please note: We currently support the repository `docker-compose.yml` and standard installations.
+We only offer support for the most recent version.
 
-We do not offer support for Cloudron, Elestio, Turnkey, or other external distribution platforms sharing unofficial versions of Leantime. 
+We do not offer support for Cloudron, Elestio, Turnkey, or other external distribution platforms sharing unofficial versions of Leantime.
 
 ## 🫴 Contributing
 

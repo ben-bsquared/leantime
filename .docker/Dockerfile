@@ -79,7 +79,7 @@ WORKDIR /var/www/html
 # Install Leantime
 ARG LEAN_VERSION
 RUN set -ex; \
-    curl -fsSL --retry 3 https://github.com/Leantime/leantime/releases/download/v${LEAN_VERSION}/Leantime-v${LEAN_VERSION}.tar.gz -o leantime.tar.gz && \
+    wget -q https://github.com/Leantime/leantime/releases/download/v${LEAN_VERSION}/Leantime-v${LEAN_VERSION}.tar.gz -O leantime.tar.gz && \
     tar xzf leantime.tar.gz --strip-components 1 && \
     rm leantime.tar.gz && \
     chown -R www-data:www-data .
@@ -122,7 +122,7 @@ USER www-data
 
 # Add healthcheck
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
-    CMD curl -f http://localhost:8080 || exit 1
+    CMD wget -q --spider http://localhost:8080 || exit 1
 
 EXPOSE 8080
 ENTRYPOINT ["/sbin/tini", "--", "/start.sh"]

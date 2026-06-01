@@ -105,6 +105,21 @@ clean:
 run-dev: build-dev
 	docker compose --file .dev/docker-compose.yaml up --detach --build --remove-orphans
 
+run-prod:
+	docker compose up --detach --remove-orphans
+
+stop-prod:
+	docker compose down
+
+pull-prod:
+	docker compose pull
+
+update-prod: pull-prod
+	docker compose up --detach --remove-orphans
+
+logs-prod:
+	docker compose logs --tail=100 -f leantime
+
 acceptance-test: build-dev
 	docker compose --file .dev/docker-compose.yaml --file .dev/docker-compose.tests.yaml up --detach --build --remove-orphans
 	docker compose --file .dev/docker-compose.yaml --file .dev/docker-compose.tests.yaml exec leantime-dev php vendor/bin/codecept clean
@@ -162,4 +177,4 @@ clear-cache:
 	find ./storage/framework/views -type d -empty -delete
 
 
-.PHONY: install-deps build-js build package clean run-dev
+.PHONY: install-deps build-js build package clean run-dev run-prod stop-prod pull-prod update-prod logs-prod
