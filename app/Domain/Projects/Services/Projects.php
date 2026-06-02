@@ -9,6 +9,8 @@ use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 use Leantime\Core\Events\DispatchesEvents;
 use Leantime\Core\Events\EventDispatcher as EventCore;
+use Leantime\Core\Exceptions\AuthorizationException;
+use Leantime\Core\Exceptions\NotFoundException;
 use Leantime\Core\Language as LanguageCore;
 use Leantime\Core\Support\Avatarcreator;
 use Leantime\Core\Support\FromFormat;
@@ -36,6 +38,14 @@ use Symfony\Component\HttpFoundation\Response;
 class Projects
 {
     use DispatchesEvents;
+
+    /**
+     * Request-scoped memo for getProjectsAssignedToUser(), keyed by
+     * "userId|status|clientId|projectTypes".
+     *
+     * @var array<string, array>
+     */
+    private array $assignedProjectsMemo = [];
 
     public function __construct(
         private ProjectRepository $projectRepository,
@@ -121,9 +131,11 @@ class Projects
 
         // Calculate percent
 
-        $numberOfClosedTickets = $this->ticketRepository->getNumberOfClosedTickets($projectId);
+        // One query for all four counts/efforts instead of four separate table scans.
+        $aggregates = $this->ticketRepository->getProjectProgressAggregates($projectId, $averageStorySize);
 
-        $numberOfTotalTickets = $this->ticketRepository->getNumberOfAllTickets($projectId);
+        $numberOfClosedTickets = $aggregates['closedCount'];
+        $numberOfTotalTickets = $aggregates['allCount'];
 
         if ($numberOfTotalTickets == 0) {
             $percentNum = 0;
@@ -131,8 +143,8 @@ class Projects
             $percentNum = ($numberOfClosedTickets / $numberOfTotalTickets) * 100;
         }
 
-        $effortOfClosedTickets = $this->ticketRepository->getEffortOfClosedTickets($projectId, $averageStorySize);
-        $effortOfTotalTickets = $this->ticketRepository->getEffortOfAllTickets($projectId, $averageStorySize);
+        $effortOfClosedTickets = $aggregates['closedEffort'];
+        $effortOfTotalTickets = $aggregates['allEffort'];
 
         if ($effortOfTotalTickets == 0) {
             $percentEffort = $percentNum; // This needs to be set to percentNum in case users choose to not use efforts
@@ -276,13 +288,11 @@ class Projects
         // Layer 2: Remove users who disabled this event type category
         $users = $this->filterUsersByEventType($users, $notification->module, $preloadedSettings);
 
-        // Extract mentioned user IDs and re-add them (mentions bypass filters)
+        // Mentions and collaborators both bypass the two filter layers above.
         $mentionedUserIds = $this->extractMentionedUserIds($notification);
-        foreach ($mentionedUserIds as $mentionedId) {
-            if ($mentionedId != $notification->authorId && ! in_array($mentionedId, $users)) {
-                $users[] = $mentionedId;
-            }
-        }
+        $collaboratorIds = $this->extractCollaboratorIds($notification);
+        $users = $this->addBypassRecipients($users, $mentionedUserIds, $notification->authorId);
+        $users = $this->addBypassRecipients($users, $collaboratorIds, $notification->authorId);
 
         $emailMessage = $notification->message;
         if ($notification->url !== false) {
@@ -295,6 +305,19 @@ class Projects
 
         // Send to messengers
         $this->messengerService->sendNotificationToMessengers($notification, $projectName);
+
+        // Send mobile push notifications to recipients with a registered
+        // device token. No-op for users with no mobile token; no-op for
+        // FCM-provider rows when LEAN_PUSH_FCM_CREDENTIALS_PATH /
+        // LEAN_PUSH_FCM_PROJECT_ID aren't configured. Wrapped in try
+        // so a push outage never breaks the rest of the notification
+        // dispatch path (queued emails + messengers still fire).
+        try {
+            $pushService = app()->make(\Leantime\Domain\Notifications\Services\Push::class);
+            $pushService->sendFromNotification($notification, $users);
+        } catch (\Throwable $e) {
+            \Illuminate\Support\Facades\Log::warning('Push dispatch failed: '.$e->getMessage());
+        }
 
         // Notify users about mentions
         // Fields that should be parsed for mentions
@@ -353,12 +376,9 @@ class Projects
         $filteredIds = $this->filterUsersByProjectRelevance($allUserIds, $notification, $preloadedSettings);
         $filteredIds = $this->filterUsersByEventType($filteredIds, $notification->module, $preloadedSettings);
 
-        // Re-add mentioned users for in-app notifications too
-        foreach ($mentionedUserIds as $mentionedId) {
-            if ($mentionedId != $notification->authorId && ! in_array($mentionedId, $filteredIds)) {
-                $filteredIds[] = $mentionedId;
-            }
-        }
+        // Re-add mentions and collaborators for in-app notifications too
+        $filteredIds = $this->addBypassRecipients($filteredIds, $mentionedUserIds, $notification->authorId);
+        $filteredIds = $this->addBypassRecipients($filteredIds, $collaboratorIds, $notification->authorId);
 
         $filteredUsersToNotify = array_filter($allUsersToNotify, fn ($u) => in_array($u['id'], $filteredIds));
 
@@ -625,6 +645,63 @@ class Projects
     }
 
     /**
+     * Extracts collaborator user IDs from a ticket notification entity.
+     *
+     * Collaborators bypass notification filters so they always receive
+     * updates for tickets they are collaborating on.
+     *
+     * @param  Notification  $notification  The notification to extract collaborators from.
+     * @return array<int> An array of unique user IDs who are collaborators.
+     */
+    private function extractCollaboratorIds(Notification $notification): array
+    {
+        if ($notification->module !== 'tickets') {
+            return [];
+        }
+
+        $collaborators = [];
+
+        if (isset($notification->entity) && is_array($notification->entity)) {
+            $collaborators = $notification->entity['collaborators'] ?? [];
+        } elseif (isset($notification->entity) && is_object($notification->entity)) {
+            $collaborators = $notification->entity->collaborators ?? [];
+        }
+
+        if (empty($collaborators) || ! is_array($collaborators)) {
+            return [];
+        }
+
+        // Only keep scalar, numeric values so non-scalars can't become bogus IDs (e.g. intval([]) === 0).
+        $scalarNumeric = array_filter($collaborators, fn ($c) => is_scalar($c) && is_numeric($c));
+        $ids = array_filter(array_map('intval', $scalarNumeric), fn ($id) => $id > 0);
+
+        return array_values(array_unique($ids));
+    }
+
+    /**
+     * Adds bypass recipients (e.g. mentions, collaborators) to a recipient list.
+     *
+     * Bypass recipients skip the two notification filter layers, so they are
+     * appended after filtering. The notification author is never added, and
+     * existing recipients are not duplicated.
+     *
+     * @param  array<int, mixed>  $recipients  The current recipient user IDs.
+     * @param  array<int, int>  $bypassUserIds  User IDs that should always receive the notification.
+     * @param  mixed  $authorId  The notification author, excluded from the result.
+     * @return array<int, mixed> The recipient list with bypass users merged in.
+     */
+    private function addBypassRecipients(array $recipients, array $bypassUserIds, mixed $authorId): array
+    {
+        foreach ($bypassUserIds as $bypassId) {
+            if ($bypassId != $authorId && ! in_array($bypassId, $recipients)) {
+                $recipients[] = $bypassId;
+            }
+        }
+
+        return $recipients;
+    }
+
+    /**
      * Gets the count of users who have muted notifications for a specific project.
      *
      * @param  int  $projectId  The project ID.
@@ -713,13 +790,17 @@ class Projects
      */
     public function getProjectsAssignedToUser($userId, string $projectStatus = 'open', $clientId = null, string $projectTypes = 'all'): array
     {
+        // Request-scoped memo: this 11-join query is hit several times per page
+        // load (status labels, multiple dashboard widgets). A user's project
+        // assignments don't change within a request, so memoizing is safe.
+        $memoKey = $userId.'|'.$projectStatus.'|'.($clientId ?? '').'|'.$projectTypes;
+        if (isset($this->assignedProjectsMemo[$memoKey])) {
+            return $this->assignedProjectsMemo[$memoKey];
+        }
+
         $projects = $this->projectRepository->getUserProjects(userId: $userId, projectStatus: $projectStatus, clientId: $clientId, projectTypes: $projectTypes);
 
-        if ($projects) {
-            return $projects;
-        } else {
-            return [];
-        }
+        return $this->assignedProjectsMemo[$memoKey] = $projects ?: [];
     }
 
     /**
@@ -1447,11 +1528,7 @@ class Projects
             }
         }
 
-        try {
-            $projectStart = $startDate;
-        } catch (\Exception $e) {
-            $projectStart = dtHelper()->now()->startOfDay();
-        }
+        $projectStart = $startDate ?? dtHelper()->now()->startOfDay();
 
         // Get interval from oldest ticket to project start date
         $interval = $oldestTicket->diff($projectStart);
@@ -1756,6 +1833,7 @@ class Projects
         $project = $this->projectRepository->getProject($projectId);
 
         // Save the path to the old picture
+        $oldPicture = null;
         if (isset($project['avatar']) && $project['avatar'] > 0) {
             $oldPicture = $project['avatar'];
         }
@@ -1842,7 +1920,7 @@ class Projects
                     'createBlueprint' => [
                         'title' => 'label.createBlueprint',
                         'status' => '',
-                        'link' => BASE_URL.'/strategy/showBoards/',
+                        'link' => BASE_URL.'/blueprints/showBoards/',
                         'description' => 'checklist.define.tasks.createBlueprint',
                     ],
                 ],
@@ -2320,7 +2398,9 @@ class Projects
      *
      * @param  array  $params  Associative status => jQuery-sortable-serialized project list
      * @param  string|null  $handler  Optional drag handler id (unused by the update)
-     * @return bool True on success, false if unauthorized or the update failed
+     * @return bool True on success (false only if the underlying write fails)
+     *
+     * @throws AuthorizationException If the caller cannot manage any project in the batch
      *
      * @api
      */
@@ -2338,7 +2418,7 @@ class Projects
                     continue;
                 }
                 if (! $this->userCanManageProject($projectId)) {
-                    return false;
+                    throw new AuthorizationException('You are not allowed to re-sort one or more of these projects.');
                 }
             }
         }
@@ -2354,7 +2434,10 @@ class Projects
      * Ticket ids are resolved to their project so the same manage-access rule applies.
      *
      * @param  array  $params  Map of (pgm-{id}|ticket-{id}|{id}) => sort position
-     * @return bool True on success, false if unauthorized or the update failed
+     * @return bool True on success (false only if the underlying write fails)
+     *
+     * @throws NotFoundException If a ticket-{id} key references a ticket that does not exist
+     * @throws AuthorizationException If the caller cannot manage any item in the payload
      *
      * @api
      */
@@ -2364,7 +2447,7 @@ class Projects
             if (str_starts_with((string) $id, 'ticket-')) {
                 $ticket = $this->ticketRepository->getTicket((int) substr((string) $id, 7));
                 if (! $ticket) {
-                    return false;
+                    throw new NotFoundException('A task referenced in the sort order could not be found.');
                 }
                 $projectId = (int) $ticket->projectId;
             } elseif (str_starts_with((string) $id, 'pgm-')) {
@@ -2374,7 +2457,7 @@ class Projects
             }
 
             if (! $this->userCanManageProject($projectId)) {
-                return false;
+                throw new AuthorizationException('You are not allowed to re-sort one or more of these items.');
             }
         }
 
@@ -2390,14 +2473,16 @@ class Projects
      *
      * @param  int  $id  The project id to patch
      * @param  array  $values  Fields to update (e.g. start, end, sortIndex)
-     * @return bool True on success, false if unauthorized or the update failed
+     * @return bool True on success (false only if the underlying write fails)
+     *
+     * @throws AuthorizationException If the caller cannot manage the target project
      *
      * @api
      */
     public function patchProject(int $id, array $values): bool
     {
         if (! $this->userCanManageProject($id)) {
-            return false;
+            throw new AuthorizationException('You are not allowed to edit this project.');
         }
 
         // Drop control fields that may leak in from the request envelope.

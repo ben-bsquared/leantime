@@ -1,5 +1,12 @@
 @php
-    $comments = app()->make(Leantime\Domain\Comments\Repositories\Comments::class);
+    // Repository is used downstream for getReplies(). Renamed from
+    // $comments because the controller already assigns $comments to
+    // the array of comments to render — overwriting it with the
+    // repository object made the @foreach below iterate the object's
+    // (empty) public properties instead of the array, so every
+    // Discussion section came up empty regardless of how the comment
+    // was added.
+    $commentsRepo = app()->make(Leantime\Domain\Comments\Repositories\Comments::class);
     $formUrl = CURRENT_URL;
     $formHash = md5($formUrl);
 
@@ -97,9 +104,23 @@
                             </span>
                         </div>
 
+                        {{-- Reply/edit box for the parent comment. Kept ABOVE the replies thread so
+                             editing a comment that has replies opens the editor in place rather than
+                             jumping below its replies. (#3319) --}}
+                        <div style="display:none;" id="comment-{{ $formHash }}-{{ $row['id'] }}" class="commentBox">
+                            <div class="commentImage">
+                                <img src="{{ BASE_URL }}/api/users?profileImage={{ session('userdata.id') }}&v={{ format(session('userdata.modified'))->timestamp() }}"/>
+                            </div>
+                            <div class="commentReply">
+                                <input type="submit" value="{{ __('links.reply') }}" name="comment" id="submit-reply-button" class="btn btn-primary"/>
+                                <input type="button" onclick="cancel({{ $row['id'] }}, '{{ $formHash }}')" value="{{ __('links.cancel') }}" class="btn btn-primary"/>
+                            </div>
+                            <div class="clearall"></div>
+                        </div>
+
                         <div class="replies">
-                            @if ($comments->getReplies($row['id']))
-                                @foreach ($comments->getReplies($row['id']) as $comment)
+                            @if ($commentsRepo->getReplies($row['id']))
+                                @foreach ($commentsRepo->getReplies($row['id']) as $comment)
                                     <div>
                                         <div class="commentImage">
                                             <img src="{{ BASE_URL }}/api/users?profileImage={{ $comment['userId'] }}&v={{ format($comment['userModified'])->timestamp() }}"/>
@@ -140,16 +161,6 @@
                                     </div>
                                 @endforeach
                             @endif
-                            <div style="display:none;" id="comment-{{ $formHash }}-{{ $row['id'] }}" class="commentBox">
-                                <div class="commentImage">
-                                    <img src="{{ BASE_URL }}/api/users?profileImage={{ session('userdata.id') }}&v={{ format(session('userdata.modified'))->timestamp() }}"/>
-                                </div>
-                                <div class="commentReply">
-                                    <input type="submit" value="{{ __('links.reply') }}" name="comment" id="submit-reply-button" class="btn btn-primary"/>
-                                    <input type="button" onclick="cancel({{ $row['id'] }}, '{{ $formHash }}')" value="{{ __('links.cancel') }}" class="btn btn-primary"/>
-                                </div>
-                                <div class="clearall"></div>
-                            </div>
                         </div>
                     </div>
                 </div>

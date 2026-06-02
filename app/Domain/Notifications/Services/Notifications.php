@@ -119,6 +119,188 @@ class Notifications
     }
 
     /**
+     * Flip a previously-read notification back to unread. Powers the
+     * swipe-to-mark-unread inbox gesture on mobile — symmetric to
+     * markNotificationRead so users can re-surface something they
+     * tapped open accidentally or want to come back to.
+     *
+     * Per the mobile-owns-explicit-RPC-params convention, userId is
+     * passed by the client. Scoping isn't critical here (the id is
+     * the primary key) but the param keeps audit logs consistent
+     * with the rest of the Notifications RPC surface.
+     *
+     * @api
+     */
+    public function markNotificationUnread(int $id, int $userId): bool
+    {
+        if ($id <= 0) {
+            return false;
+        }
+
+        return $this->notificationsRepo->markNotificationUnread($id);
+    }
+
+    /**
+     * Unread notification count for the authenticated user. Mobile uses
+     * this for the app-icon badge and the inbox tab unread dot. Cheap
+     * because the (userId, read) composite index on zp_notifications
+     * makes it a fast count.
+     *
+     * @api
+     */
+    public function getUnreadCount(): int
+    {
+        $userId = (int) session('userdata.id');
+        if ($userId === 0) {
+            return 0;
+        }
+
+        // Delegated to the Repository — Service stores the raw DbCore
+        // (no query-builder helpers), Repository stores the resolved
+        // Illuminate ConnectionInterface. Following the established
+        // pattern that all SQL lives in the Repository layer.
+        return $this->notificationsRepo->getUnreadCount($userId);
+    }
+
+    /**
+     * Register a mobile device's push token for the authenticated user.
+     * Mobile calls this on every login (idempotent). The push fields
+     * live directly on the bearer's zp_access_tokens row, so:
+     *   - logout / token revoke deletes the push registration too
+     *     (no orphan rows, no prune cron needed)
+     *   - re-login auto-creates a fresh row that will be updated on the
+     *     next registerPushToken call
+     *
+     * Per [[feedback-mobile-owns-explicit-rpc-params]] convention,
+     * userId is resolved server-side from session — we don't accept it
+     * from the client (a stolen bearer shouldn't be able to register
+     * push tokens on someone else's account).
+     *
+     * Provider:
+     *   - 'fcm': raw Firebase Cloud Messaging registration token.
+     *            Dispatched direct to FCM HTTP v1.
+     *
+     * No token-format validation. Bad tokens are caught at send-time
+     * by FCM (UNREGISTERED / INVALID_ARGUMENT) and we mark
+     * push_invalidated_at then. Pre-validating here would just shift a
+     * small class of failures earlier without saving any work.
+     *
+     * The push_provider column on zp_access_tokens is retained for
+     * forward compatibility, but only 'fcm' is accepted today.
+     *
+     * @param  string  $token  FCM registration token
+     * @param  string  $platform  'ios' or 'android'
+     * @param  string|null  $deviceName  Ignored — kept for backwards-
+     *                                   compat with mobile clients that
+     *                                   still send it; the device name
+     *                                   lives on zp_access_tokens.name
+     *                                   already (set at login time)
+     * @param  string  $provider  Must be 'fcm' (default 'fcm')
+     *
+     * @api
+     */
+    public function registerPushToken(string $token, string $platform, ?string $deviceName = null, string $provider = 'fcm'): bool
+    {
+        $userId = (int) session('userdata.id');
+        if ($userId === 0) {
+            return false;
+        }
+
+        if (! in_array($platform, ['ios', 'android'], true)) {
+            return false;
+        }
+        if ($provider !== 'fcm') {
+            return false;
+        }
+        if ($token === '') {
+            return false;
+        }
+
+        $accessTokenId = $this->resolveCurrentAccessTokenId($userId);
+        if ($accessTokenId === null) {
+            return false;
+        }
+
+        return \Illuminate\Support\Facades\DB::table('zp_access_tokens')
+            ->where('id', $accessTokenId)
+            ->update([
+                'push_token' => $token,
+                'push_platform' => $platform,
+                'push_provider' => $provider,
+                'push_token_updated_at' => now(),
+                'push_invalidated_at' => null,
+            ]) > 0;
+    }
+
+    /**
+     * Unregister this device's push token (called on mobile logout
+     * BEFORE the bearer is cleared, so the access token row is still
+     * resolvable). Soft-delete via push_invalidated_at — preserves the
+     * access-token row itself for the rest of the logout sequence.
+     *
+     * @param  string  $token  The push token being unregistered. Kept
+     *                         for backwards-compat with mobile clients
+     *                         that pass it; we only need the bearer to
+     *                         identify the row, but a mismatch between
+     *                         passed-in token and stored token signals
+     *                         a race we should ignore (return true
+     *                         either way so logout doesn't fail).
+     *
+     * @api
+     */
+    public function unregisterPushToken(string $token): bool
+    {
+        $userId = (int) session('userdata.id');
+        if ($userId === 0) {
+            return false;
+        }
+
+        $accessTokenId = $this->resolveCurrentAccessTokenId($userId);
+        if ($accessTokenId === null) {
+            return false;
+        }
+
+        \Illuminate\Support\Facades\DB::table('zp_access_tokens')
+            ->where('id', $accessTokenId)
+            ->update(['push_invalidated_at' => now()]);
+
+        return true;
+    }
+
+    /**
+     * Resolve the zp_access_tokens.id for the bearer that authenticated
+     * the current request. Tries Sanctum's currentAccessToken() first;
+     * falls back to the most-recently-used row for the user when the
+     * Sanctum guard isn't bound (legacy session-only auth path).
+     *
+     * Returns null only when no rows exist for the user — at that point
+     * the caller can't register push without a row to attach it to.
+     */
+    private function resolveCurrentAccessTokenId(int $userId): ?int
+    {
+        try {
+            $user = auth()->user();
+            if ($user !== null && method_exists($user, 'currentAccessToken')) {
+                $current = $user->currentAccessToken();
+                if ($current !== null && isset($current->id)) {
+                    return (int) $current->id;
+                }
+            }
+        } catch (\Throwable $e) {
+            // Sanctum guard not bound or user model doesn't support
+            // currentAccessToken — fall through to the lookup below.
+        }
+
+        $row = \Illuminate\Support\Facades\DB::table('zp_access_tokens')
+            ->where('tokenable_id', $userId)
+            ->orderByDesc('last_used_at')
+            ->orderByDesc('id')
+            ->first();
+
+        return $row !== null ? (int) $row->id : null;
+    }
+
+    /**
      * @throws BindingResolutionException
      *
      * @api

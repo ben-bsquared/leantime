@@ -81,6 +81,10 @@ class Install
         30413,
         30500,
         30501,
+        30502,
+        // 30503 (zp_device_tokens) intentionally skipped — superseded by
+        // 30504 which puts push columns on zp_access_tokens instead.
+        30504,
     ];
 
     /**
@@ -2493,6 +2497,158 @@ class Install
             Log::error('Migration 30501: '.$e->getMessage());
 
             return ['Migration 30501 failed: '.$e->getMessage()];
+        }
+
+        return true;
+    }
+
+    /**
+     * Migration 30502: Create the WorkStructure tables (structures, elements,
+     * relationships, mappings) for the meta-model that orchestrates entities
+     * across domains. Mirrors SchemaBuilder::createWorkStructureTables().
+     *
+     * @return bool|array Returns true on success, array of errors on failure
+     */
+    public function update_sql_30502(): bool|array
+    {
+        try {
+            if (! Schema::hasTable('zp_work_structures')) {
+                Schema::create('zp_work_structures', function (Blueprint $table) {
+                    $table->id();
+                    $table->string('title', 255);
+                    $table->text('description')->nullable();
+                    $table->string('type', 50)->default('custom');
+                    $table->integer('created_by')->nullable();
+                    $table->json('meta')->nullable();
+                    $table->dateTime('created_at')->nullable();
+                    $table->dateTime('modified_at')->nullable();
+
+                    $table->unique(['title'], 'idx_work_structures_title');
+                    $table->index(['type'], 'idx_work_structures_type');
+                });
+            }
+
+            if (! Schema::hasTable('zp_work_structure_elements')) {
+                Schema::create('zp_work_structure_elements', function (Blueprint $table) {
+                    $table->id();
+                    $table->unsignedBigInteger('structure_id');
+                    $table->string('type_key', 50);
+                    $table->string('label', 100);
+                    $table->text('description')->nullable();
+                    $table->string('domain_reference', 255)->nullable();
+                    $table->integer('sort_order')->default(0);
+                    $table->json('meta')->nullable();
+                    $table->dateTime('created_at')->nullable();
+
+                    $table->index(['structure_id'], 'idx_wse_structure_id');
+                    $table->unique(['structure_id', 'type_key'], 'idx_wse_structure_type_key');
+                });
+            }
+
+            if (! Schema::hasTable('zp_work_structure_relationships')) {
+                Schema::create('zp_work_structure_relationships', function (Blueprint $table) {
+                    $table->id();
+                    $table->unsignedBigInteger('structure_id');
+                    $table->unsignedBigInteger('from_element_id');
+                    $table->unsignedBigInteger('to_element_id');
+                    $table->string('relationship_type', 50);
+                    $table->text('description')->nullable();
+                    $table->json('meta')->nullable();
+
+                    $table->index(['structure_id'], 'idx_wsr_structure_id');
+                });
+            }
+
+            if (! Schema::hasTable('zp_work_structure_mappings')) {
+                Schema::create('zp_work_structure_mappings', function (Blueprint $table) {
+                    $table->id();
+                    $table->unsignedBigInteger('source_structure_id');
+                    $table->unsignedBigInteger('source_element_id');
+                    $table->unsignedBigInteger('target_structure_id');
+                    $table->unsignedBigInteger('target_element_id');
+                    $table->string('mapping_type', 50)->default('generates');
+                    $table->json('meta')->nullable();
+
+                    $table->index(['source_structure_id', 'target_structure_id'], 'idx_wsm_source_target');
+                    // Enforce the same idempotency key StructureRegistry::registerMappings()
+                    // checks in application code, so a race can't insert a duplicate mapping
+                    // for the same source element → target structure.
+                    $table->unique(['source_structure_id', 'source_element_id', 'target_structure_id'], 'idx_wsm_unique_mapping');
+                });
+            }
+        } catch (\Exception $e) {
+            Log::error('Migration 30502: '.$e->getMessage());
+
+            return ['Migration 30502 failed: '.$e->getMessage()];
+        }
+
+        return true;
+    }
+
+    /**
+     * Push notification fields on zp_access_tokens — refactor of the
+     * original (never-fired-in-production) zp_device_tokens table from
+     * the earlier #3401 design. Per discussion: lifecycle is naturally
+     * tied to the user's login session, so we piggyback the bearer-
+     * token row instead of maintaining a parallel table + prune cron.
+     * Logout invalidates the row → push registration dies with it.
+     *
+     * Columns added to zp_access_tokens:
+     *   - push_token            VARCHAR(255) NULL — opaque token (Expo
+     *                                              or FCM, see provider)
+     *   - push_platform         VARCHAR(16)  NULL — 'ios' or 'android'
+     *   - push_provider         VARCHAR(8)   NULL — 'expo' or 'fcm'
+     *   - push_token_updated_at TIMESTAMP    NULL — refreshed each
+     *                                              registerPushToken call
+     *   - push_invalidated_at   TIMESTAMP    NULL — set by mobile
+     *                                              unregister OR provider
+     *                                              DeviceNotRegistered
+     *
+     * The zp_device_tokens table from #3401's update_sql_30503 is no
+     * longer used. Installs that ran 30503 will have an empty
+     * zp_device_tokens table sitting unused — safe to drop in a
+     * future cleanup PR; not dropped here to keep this migration
+     * additive-only.
+     */
+    public function update_sql_30504(): bool|array
+    {
+        try {
+            Schema::table('zp_access_tokens', function (Blueprint $table) {
+                if (! Schema::hasColumn('zp_access_tokens', 'push_token')) {
+                    $table->string('push_token', 255)->nullable()->after('expires_at');
+                }
+                if (! Schema::hasColumn('zp_access_tokens', 'push_platform')) {
+                    $table->string('push_platform', 16)->nullable()->after('push_token');
+                }
+                if (! Schema::hasColumn('zp_access_tokens', 'push_provider')) {
+                    $table->string('push_provider', 8)->nullable()->after('push_platform');
+                }
+                if (! Schema::hasColumn('zp_access_tokens', 'push_token_updated_at')) {
+                    $table->timestamp('push_token_updated_at')->nullable()->after('push_provider');
+                }
+                if (! Schema::hasColumn('zp_access_tokens', 'push_invalidated_at')) {
+                    $table->timestamp('push_invalidated_at')->nullable()->after('push_token_updated_at');
+                }
+            });
+
+            // Index for "active push tokens for user" — the dominant
+            // access pattern when dispatching push. Skipped if it
+            // already exists from a re-run.
+            $existingIndexes = collect(\Illuminate\Support\Facades\DB::select('SHOW INDEX FROM zp_access_tokens'))
+                ->pluck('Key_name')
+                ->toArray();
+            if (! in_array('idx_access_tokens_tokenable_push', $existingIndexes, true)) {
+                Schema::table('zp_access_tokens', function (Blueprint $table) {
+                    $table->index(
+                        ['tokenable_id', 'push_invalidated_at'],
+                        'idx_access_tokens_tokenable_push'
+                    );
+                });
+            }
+        } catch (\Exception $e) {
+            Log::error('Migration 30504: '.$e->getMessage());
+
+            return ['Migration 30504 failed: '.$e->getMessage()];
         }
 
         return true;

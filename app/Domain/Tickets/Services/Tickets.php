@@ -12,6 +12,8 @@ use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 use Leantime\Core\Configuration\Environment as EnvironmentCore;
 use Leantime\Core\Events\DispatchesEvents;
+use Leantime\Core\Exceptions\AuthorizationException;
+use Leantime\Core\Exceptions\NotFoundException;
 use Leantime\Core\Language as LanguageCore;
 use Leantime\Core\Support\DateTimeHelper;
 use Leantime\Core\Support\FromFormat;
@@ -38,6 +40,13 @@ use Leantime\Domain\Timesheets\Services\Timesheets as TimesheetService;
 class Tickets
 {
     use DispatchesEvents;
+
+    /**
+     * Request-scoped memo for getAllStatusLabelsByUserId(), keyed by "userId|currentProject".
+     *
+     * @var array<string, array>
+     */
+    private array $statusLabelsByUserMemo = [];
 
     /**
      * Constructor method for the class.
@@ -99,6 +108,13 @@ class Tickets
      */
     public function getAllStatusLabelsByUserId($userId): array
     {
+        // Request-scoped memo: this is called repeatedly within a single dashboard
+        // load (e.g. twice inside getToDoWidgetHierarchicalAssignments, plus the
+        // weekly/sprint queries) and the result is stable for the request.
+        $memoKey = $userId.'|'.(session()->exists('currentProject') ? session('currentProject') : '');
+        if (isset($this->statusLabelsByUserMemo[$memoKey])) {
+            return $this->statusLabelsByUserMemo[$memoKey];
+        }
 
         $statusLabelsByProject = [];
 
@@ -115,8 +131,9 @@ class Tickets
         }
 
         // There is a non zero chance that a user has tickets assigned to them without a project assignment.
-        // Checking user assigned tickets to see if there are missing projects.
-        $allTickets = $this->ticketRepository->getAllBySearchCriteria(['currentProject' => '', 'users' => $userId, 'status' => 'not_done', 'sprint' => ''], 'duedate');
+        // Checking user assigned tickets to see if there are missing projects. We only need the
+        // distinct project ids here, so skip the (expensive) comment/file/subtask count subqueries.
+        $allTickets = $this->ticketRepository->getAllBySearchCriteria(['currentProject' => '', 'users' => $userId, 'status' => 'not_done', 'sprint' => ''], 'duedate', null, false);
 
         foreach ($allTickets as $row) {
             if (! isset($statusLabelsByProject[$row['projectId']])) {
@@ -124,7 +141,7 @@ class Tickets
             }
         }
 
-        return $statusLabelsByProject;
+        return $this->statusLabelsByUserMemo[$memoKey] = $statusLabelsByProject;
     }
 
     /**
@@ -1107,6 +1124,43 @@ class Tickets
     }
 
     /**
+     * Whether the current user holds at least the given role IN a specific project.
+     *
+     * Leantime roles are project-scoped: Auth::userIsAtLeast() evaluates the role
+     * for the current *session* project, so it can't be trusted to authorize an
+     * action on an entity that lives in a different project. This resolves the
+     * user's effective role for $projectId — managers/admins/owners keep their
+     * global role across every project; otherwise the project role applies,
+     * falling back to the global role when no explicit project role is set — and
+     * compares it against the required role using the same ordering as Roles.
+     *
+     * @param  string  $role  Minimum role (a Roles::$* string).
+     * @param  int  $projectId  The project that owns the entity being changed.
+     */
+    private function userIsAtLeastForProject(string $role, int $projectId): bool
+    {
+        $roles = Roles::getRoles();
+        $globalRole = session('userdata.role');
+
+        $globalKey = array_search($globalRole, $roles, true);
+        $managerKey = array_search(Roles::$manager, $roles, true);
+
+        // Manager+ (manager, admin, owner) keep their global role everywhere.
+        if ($globalKey !== false && $managerKey !== false && $globalKey >= $managerKey) {
+            $effectiveRole = $globalRole;
+        } else {
+            $projectRole = $this->projectService->getProjectRole(session('userdata.id'), $projectId);
+            // No explicit project role -> inherit the global role.
+            $effectiveRole = $projectRole === '' ? $globalRole : Roles::getRoleString((int) $projectRole);
+        }
+
+        $requiredKey = array_search($role, $roles, true);
+        $effectiveKey = array_search($effectiveRole, $roles, true);
+
+        return $requiredKey !== false && $effectiveKey !== false && $effectiveKey >= $requiredKey;
+    }
+
+    /**
      * @api
      */
     public function getLastTickets($projectId, int $limit = 5): bool|array
@@ -1854,6 +1908,7 @@ class Tickets
             'milestoneid' => isset($params['milestone']) ? (int) $params['milestone'] : '',
             'dependingTicketId' => isset($params['dependingTicketId']) ? (int) $params['dependingTicketId'] : '',
             'sortIndex' => $params['sortIndex'] ?? '',
+            'collaborators' => $params['collaborators'] ?? [],
         ];
 
         if ($values['headline'] == '') {
@@ -2090,13 +2145,27 @@ class Tickets
      */
     public function updateTicket($values): array|bool
     {
+        // Server-side authorization. Editing is gated to editor+ in the UI, but the
+        // Kanban/Table modal path posted straight to updateTicket without enforcing it,
+        // letting commenter/reader roles edit tickets via a direct request (#3376).
+        //
+        // Authorize against the ticket's CURRENT project, not the session project.
+        // getTicket() returns false unless the user is assigned to the ticket's
+        // project, and the editor check is then evaluated against THAT project's
+        // role. Leantime roles are project-scoped, so an editor in project A who is
+        // only a commenter in project B must not be able to edit B's ticket by
+        // keeping the session on A and posting B's ticket id. (#3376 + review)
+        $currentTicket = $this->getTicket($values['id']);
+
+        if (! $currentTicket) {
+            return ['msg' => 'notifications.ticket_save_error_no_access', 'type' => 'error'];
+        }
+
+        if (! $this->userIsAtLeastForProject(Roles::$editor, (int) $currentTicket->projectId)) {
+            return ['msg' => 'notifications.ticket_save_error_no_access', 'type' => 'error'];
+        }
+
         if (! isset($values['headline'])) {
-            $currentTicket = $this->getTicket($values['id']);
-
-            if (! $currentTicket) {
-                return ['msg' => 'This ticket id does not exist within your leantime account.', 'type' => 'error'];
-            }
-
             $values['headline'] = $currentTicket->headline;
         }
 
@@ -2323,23 +2392,26 @@ class Tickets
      *
      * @param  int  $id  The ticket id to update
      * @param  array  $values  The fields to update
-     * @return bool True on success, false if unauthorized or the update failed
+     * @return bool True on success (false only if the underlying write fails)
+     *
+     * @throws AuthorizationException If the caller is not an editor, or is not assigned to the ticket's project
+     * @throws NotFoundException If the ticket does not exist
      *
      * @api
      */
     public function patchTicket(int $id, array $values): bool
     {
         if (! Auth::userIsAtLeast(Roles::$editor)) {
-            return false;
+            throw new AuthorizationException('You are not allowed to edit tasks.');
         }
 
         $ticket = $this->getTicket($id);
         if (! $ticket) {
-            return false;
+            throw new NotFoundException('The task you tried to edit could not be found.');
         }
 
         if (! $this->projectService->isUserAssignedToProject(session('userdata.id'), $ticket->projectId)) {
-            return false;
+            throw new AuthorizationException('You are not allowed to edit this task.');
         }
 
         return $this->patch($id, $values);
@@ -2366,11 +2438,21 @@ class Tickets
             return false;
         }
 
+        // Handle collaborators separately since they live in the relationship table, not on zp_tickets
+        $collaboratorsUpdated = false;
+        if (array_key_exists('collaborators', $params)) {
+            $collaborators = is_array($params['collaborators']) ? $params['collaborators'] : [];
+            $this->ticketRepository->removeCollaborators($id);
+            $this->ticketRepository->addCollaborators($id, $collaborators, session('userdata.id'));
+            $collaboratorsUpdated = true;
+            unset($params['collaborators']);
+        }
+
         $params = $this->prepareTicketDates($params);
 
         $return = $this->ticketRepository->patchTicket($id, $params);
 
-        if (! $return) {
+        if (! $return && ! $collaboratorsUpdated) {
             return false;
         }
 
@@ -2399,7 +2481,7 @@ class Tickets
             $this->projectService->notifyProjectUsers($notification);
         }
 
-        return (bool) $return;
+        return true;
     }
 
     /**
@@ -2446,12 +2528,55 @@ class Tickets
      */
     public function quickUpdateMilestone($params): array|bool
     {
+        if ($params['headline'] == '') {
+            return ['status' => 'error', 'message' => 'Headline Missing'];
+        }
+
+        $milestoneId = (int) $params['id'];
+
+        // Load via the service so the project-assignment gate applies; a milestone
+        // in a project the user can't access returns false. (review)
+        $existingMilestone = $this->getTicket($milestoneId);
+
+        if (! $existingMilestone) {
+            return ['status' => 'error', 'message' => 'You are not allowed to edit this milestone.'];
+        }
+
+        $currentProjectId = (int) $existingMilestone->projectId;
+
+        // Editing a milestone is an edit op: require editor+ in the milestone's
+        // OWN project, evaluated project-scoped rather than against the session
+        // project's role. (review)
+        if (! $this->userIsAtLeastForProject(Roles::$editor, $currentProjectId)) {
+            return ['status' => 'error', 'message' => 'You are not allowed to edit this milestone.'];
+        }
+
+        // Honor the project chosen in the milestone dialog (#3294); the dialog
+        // posts projectId via a <select>. Fall back to the milestone's current
+        // project when callers (e.g. inline kanban edits) don't supply one.
+        $targetProjectId = (int) ($params['projectId'] ?? $currentProjectId);
+
+        if ($targetProjectId !== $currentProjectId) {
+            // The projectId is caller-supplied: require editor+ in the target
+            // project too, so a milestone can't be moved into a project where the
+            // user lacks edit rights. (#3294 review / IDOR)
+            if (! $this->userIsAtLeastForProject(Roles::$editor, $targetProjectId)) {
+                return ['status' => 'error', 'message' => 'You are not allowed to move this milestone to that project.'];
+            }
+
+            // Moving a milestone must take its tasks with it, otherwise they're
+            // left orphaned referencing a milestone in another project. moveTicket()
+            // already moves the milestone's children and the milestone row. (#3294 review)
+            if ($this->moveTicket($milestoneId, $targetProjectId) === false) {
+                return ['status' => 'error', 'message' => 'Could not move milestone to the new project.'];
+            }
+        }
 
         $values = [
             'headline' => $params['headline'],
             'type' => 'milestone',
             'description' => '',
-            'projectId' => session('currentProject'),
+            'projectId' => $targetProjectId,
             'editorId' => $params['editorId'],
             'userId' => session('userdata.id'),
             'date' => dtHelper()->userNow()->formatDateTimeForDb(),
@@ -2470,18 +2595,12 @@ class Tickets
             'editTo' => $params['editTo'] ?? '',
         ];
 
-        if ($values['headline'] == '') {
-            $error = ['status' => 'error', 'message' => 'Headline Missing'];
-
-            return $error;
-        }
-
         $values = $this->prepareTicketDates($values);
 
         self::dispatchEvent('milestone_updated');
 
         // $params is an array of field names. Exclude id
-        return $this->ticketRepository->updateTicket($values, $params['id']);
+        return $this->ticketRepository->updateTicket($values, $milestoneId);
     }
 
     /**
@@ -2591,11 +2710,13 @@ class Tickets
     {
         $result = $this->quickUpdateMilestone($params);
 
-        // Preserve legacy behavior: the controller treated any truthy result
-        // (including the headline-missing error array) as success and fired
-        // the notification, so we mirror that exactly.
-        if (! $result) {
-            return $result;
+        // Only a genuine success (true) should notify and report success.
+        // quickUpdateMilestone returns a truthy error array on its failure paths
+        // (headline missing, denied/failed project move); those must not be read
+        // as a successful edit. Return false so the caller surfaces the
+        // save-error notification instead of a false success. (review)
+        if ($result !== true) {
+            return false;
         }
 
         $subject = $this->language->__('email_notifications.milestone_update_subject');
@@ -2875,24 +2996,27 @@ class Tickets
      * controller-level gate), then delegates to the internal updateTicketSorting().
      *
      * @param  array  $params  Array of ticketId => sortPosition from Gantt drag-drop
-     * @return bool True on success, false if unauthorized or the update failed
+     * @return bool True on success (false only if the underlying write fails)
+     *
+     * @throws AuthorizationException If the caller is not an editor, or is not assigned to a referenced task's project
+     * @throws NotFoundException If a referenced task does not exist
      *
      * @api
      */
     public function sortTickets(array $params): bool
     {
         if (! Auth::userIsAtLeast(Roles::$editor)) {
-            return false;
+            throw new AuthorizationException('You are not allowed to re-sort tasks.');
         }
 
         $userId = session('userdata.id');
         foreach (array_keys($params) as $ticketId) {
             $ticket = $this->getTicket((int) $ticketId);
             if (! $ticket) {
-                return false;
+                throw new NotFoundException('A task referenced in the sort order could not be found.');
             }
             if (! $this->projectService->isUserAssignedToProject($userId, $ticket->projectId)) {
-                return false;
+                throw new AuthorizationException('You are not allowed to re-sort this task.');
             }
         }
 
@@ -3120,6 +3244,7 @@ class Tickets
             return ['msg' => 'notifications.ticket_delete_error', 'type' => 'error'];
         }
 
+        // Collaborator relationship rows are cleaned up inside the repository's delticket().
         if ($this->ticketRepository->delticket($id)) {
 
             self::dispatchEvent('ticket_deleted');
@@ -3474,7 +3599,9 @@ class Tickets
         $ticketIds = [];
 
         foreach ($groupedTickets as $group) {
-            foreach (($group['items'] ?? []) as $ticket) {
+            // Support both 'items' (list/kanban views) and 'tickets' (ToDoWidget views)
+            $items = $group['items'] ?? $group['tickets'] ?? [];
+            foreach ($items as $ticket) {
                 if (isset($ticket['id'])) {
                     $ticketIds[] = (int) $ticket['id'];
                 }
@@ -3488,11 +3615,16 @@ class Tickets
         $collaboratorsByTicket = $this->ticketRepository->getCollaboratorsByTicketIds($ticketIds);
 
         foreach ($groupedTickets as &$group) {
-            if (! isset($group['items']) || ! is_array($group['items'])) {
+            // Determine which key holds the ticket array
+            if (isset($group['items']) && is_array($group['items'])) {
+                $key = 'items';
+            } elseif (isset($group['tickets']) && is_array($group['tickets'])) {
+                $key = 'tickets';
+            } else {
                 continue;
             }
 
-            foreach ($group['items'] as &$ticket) {
+            foreach ($group[$key] as &$ticket) {
                 $ticketId = (int) ($ticket['id'] ?? 0);
                 $editorId = (int) ($ticket['editorId'] ?? 0);
                 $collaboratorIds = $collaboratorsByTicket[$ticketId] ?? [];
@@ -3562,6 +3694,8 @@ class Tickets
             $groupBy = 'time';
         }
 
+        $tickets = [];
+
         if ($groupBy === 'time') {
             $tickets = $this->getOpenUserTicketsThisWeekAndLater(userId: session('userdata.id'), projectId: $projectFilter, includeMilestones: true);
         } elseif ($groupBy === 'project') {
@@ -3589,6 +3723,7 @@ class Tickets
             }
         }
 
+        $tickets = $this->enrichGroupedTicketsWithCollaborators($tickets);
         $tickets = self::dispatch_filter('myTodoWidgetTasks', $tickets);
 
         return [
@@ -3723,12 +3858,17 @@ class Tickets
         //                }
         //            }
 
+        // Enrich while tickets are still flat — buildTicketHierarchy() nests subtasks into
+        // 'children', so enriching afterwards would only reach the root rows.
+        $tickets = $this->enrichGroupedTicketsWithCollaborators($tickets);
+
         // Process tickets to build hierarchical structure
         foreach ($tickets as $groupKey => &$ticketGroup) {
             if (isset($ticketGroup['tickets']) && is_array($ticketGroup['tickets'])) {
                 $ticketGroup['tickets'] = $this->buildTicketHierarchy($ticketGroup['tickets'], $sortingArray);
             }
         }
+        unset($ticketGroup);
 
         $onTheClock = $this->timesheetService->isClocked(session('userdata.id'));
         $effortLabels = $this->getEffortLabels();
@@ -3746,7 +3886,9 @@ class Tickets
                 }
             }
         }
+        unset($ticketGroup);
 
+        // Collaborators were enriched above, before the hierarchy was built.
         $tickets = self::dispatch_filter('myTodoWidgetTasks', $tickets);
 
         return [

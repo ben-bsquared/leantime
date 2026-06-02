@@ -35,6 +35,13 @@ class Users
     public array $status = ['active' => 'label.active', 'inactive' => 'label.inactive', 'invited' => 'label.invited'];
 
     /**
+     * Request-scoped memo for getUser(), keyed by user id. Cleared on writes.
+     *
+     * @var array<int|string, array|bool>
+     */
+    private array $userMemo = [];
+
+    /**
      * __construct - neu db connection
      */
     public function __construct(
@@ -51,12 +58,18 @@ class Users
      */
     public function getUser($id): array|bool
     {
+        // Request-scoped memo: getUser is hit repeatedly per request for
+        // author/role/avatar lookups. Cleared by editUser/patchUser/deleteUser.
+        if (array_key_exists($id, $this->userMemo)) {
+            return $this->userMemo[$id];
+        }
+
         $result = $this->connection->table('zp_user')
             ->where('id', $id)
             ->limit(1)
             ->first();
 
-        return $result ? (array) $result : false;
+        return $this->userMemo[$id] = $result ? (array) $result : false;
     }
 
     /**
@@ -270,6 +283,8 @@ class Users
      */
     public function editUser(array $values, $id): bool
     {
+        unset($this->userMemo[$id]);
+
         $updateData = [
             'firstname' => $values['firstname'],
             'lastname' => $values['lastname'],
@@ -292,7 +307,6 @@ class Users
 
         return $this->connection->table('zp_user')
             ->where('id', $id)
-            ->limit(1)
             ->update($updateData);
     }
 
@@ -324,7 +338,6 @@ class Users
     {
         return $this->connection->table('zp_user')
             ->where('id', $userId)
-            ->limit(1)
             ->update([
                 'clientId' => null,
                 'modified' => now(),
@@ -351,7 +364,6 @@ class Users
 
         $this->connection->table('zp_user')
             ->where('id', $id)
-            ->limit(1)
             ->update($updateData);
     }
 
@@ -387,6 +399,8 @@ class Users
      */
     public function deleteUser($id): void
     {
+        unset($this->userMemo[$id]);
+
         $this->connection->table('zp_user')
             ->where('zp_user.id', $id)
             ->delete();
@@ -429,6 +443,8 @@ class Users
 
     public function patchUser($id, $params): bool
     {
+        unset($this->userMemo[$id]);
+
         $updates = [];
         foreach ($params as $key => $value) {
             $cleanKey = DbCore::sanitizeToColumnString($key);
@@ -443,7 +459,6 @@ class Users
 
         return $this->connection->table('zp_user')
             ->where('id', $id)
-            ->limit(1)
             ->update($updates);
     }
 
