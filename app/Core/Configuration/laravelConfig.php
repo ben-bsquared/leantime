@@ -648,12 +648,26 @@ return [
        |
         */
         'client' => 'phpredis',
-        'options' => [
-            'parameters' => ['timeout' => 1.0],
-            'cluster' => 'redis',
-            'context' => [],
-            'compression' => 3, // Redis::COMPRESSION_LZ4
-        ],
+        'options' => (function () {
+            $options = [
+                'parameters' => ['timeout' => 1.0],
+                'cluster' => 'redis',
+                'context' => [],
+            ];
+
+            $compression = null;
+            if (defined('Redis::COMPRESSION_LZ4')) {
+                $compression = constant('Redis::COMPRESSION_LZ4');
+            } elseif (defined('Redis::COMPRESSION_NONE')) {
+                $compression = constant('Redis::COMPRESSION_NONE');
+            }
+
+            if ($compression !== null) {
+                $options['compression'] = $compression;
+            }
+
+            return $options;
+        })(),
         'default' => [
             'url' => env('LEAN_REDIS_URL', ''),
             'scheme' => env('LEAN_REDIS_SCHEME', 'tls'),
